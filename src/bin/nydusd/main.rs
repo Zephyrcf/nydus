@@ -58,37 +58,37 @@ fn append_fs_options(app: Command) -> Command {
             .help("Path to the RAFS filesystem metadata file")
             .conflicts_with("shared-dir"),
     )
-    .arg(
-        Arg::new("localfs-dir")
-            .long("localfs-dir")
-            .short('D')
-            .help(
-                "Path to the `localfs` working directory, which also enables the `localfs` storage backend"
-            )
-            .conflicts_with("config"),
-    )
-    .arg(
-        Arg::new("shared-dir")
-            .long("shared-dir")
-            .short('s')
-            .help("Path to the directory to be shared via the `passthroughfs` FUSE driver")
-    )
-    .arg(
-        Arg::new("prefetch-files")
-            .long("prefetch-files")
-            .help("Path to the prefetch configuration file containing a list of directories/files separated by newlines")
-            .required(false)
-            .requires("bootstrap")
-            .num_args(1),
-    )
-    .arg(
-        Arg::new("virtual-mountpoint")
-            .long("virtual-mountpoint")
-            .short('m')
-            .help("Mountpoint within the FUSE/virtiofs device to mount the RAFS/passthroughfs filesystem")
-            .default_value("/")
-            .required(false),
-    );
+        .arg(
+            Arg::new("localfs-dir")
+                .long("localfs-dir")
+                .short('D')
+                .help(
+                    "Path to the `localfs` working directory, which also enables the `localfs` storage backend"
+                )
+                .conflicts_with("config"),
+        )
+        .arg(
+            Arg::new("shared-dir")
+                .long("shared-dir")
+                .short('s')
+                .help("Path to the directory to be shared via the `passthroughfs` FUSE driver")
+        )
+        .arg(
+            Arg::new("prefetch-files")
+                .long("prefetch-files")
+                .help("Path to the prefetch configuration file containing a list of directories/files separated by newlines")
+                .required(false)
+                .requires("bootstrap")
+                .num_args(1),
+        )
+        .arg(
+            Arg::new("virtual-mountpoint")
+                .long("virtual-mountpoint")
+                .short('m')
+                .help("Mountpoint within the FUSE/virtiofs device to mount the RAFS/passthroughfs filesystem")
+                .default_value("/")
+                .required(false),
+        );
 
     #[cfg(feature = "dedup")]
     {
@@ -490,7 +490,18 @@ fn process_fs_service(
         None
     };
 
-    let vfs = create_vfs_backend(fs_type, is_fuse, args.is_present("hybrid-mode"))?;
+    // Extract the UID/GID mapping from the RAFS config (if any) so that nydusd can
+    // remap ownership at the FUSE VFS layer for user-namespace (remap-ids) support.
+    let id_mapping = match mount_cmd.as_ref() {
+        None => (0, 0, 0),
+        Some(cmd) => {
+            use std::str::FromStr;
+            let cfg = ConfigV2::from_str(&cmd.config)
+                .map_err(|e| einval!(format!("invalid RAFS config: {}", e)))?;
+            cfg.get_id_mapping().unwrap_or((0, 0, 0))
+        }
+    };
+    let vfs = create_vfs_backend(fs_type, is_fuse, args.is_present("hybrid-mode"), id_mapping)?;
     // Basically, below two arguments are essential for live-upgrade/failover/ and external management.
     let daemon_id = args.value_of("id").map(|id| id.to_string());
     let supervisor = args.value_of("supervisor").map(|s| s.to_string());
@@ -564,8 +575,18 @@ fn process_singleton_arguments(
     let config = match subargs.value_of("config") {
         None => None,
         Some(path) => {
-            let config = std::fs::read_to_string(path)?;
-            let config: serde_json::Value = serde_json::from_str(&config)
+            use std::str::FromStr;
+            let config_content = std::fs::read_to_string(path)?;
+            // Reject id_mapping in fscache singleton mode: it is only supported
+            // for the FUSE/VFS path where fuse-backend-rs can remap ownership.
+            if let Ok(cfg) = ConfigV2::from_str(&config_content) {
+                if cfg.get_id_mapping().is_some() {
+                    return Err(einval!(
+                        "id_mapping is not supported in fscache singleton mode"
+                    ));
+                }
+            }
+            let config: serde_json::Value = serde_json::from_str(&config_content)
                 .map_err(|_e| einval!("invalid configuration file"))?;
             Some(config)
         }

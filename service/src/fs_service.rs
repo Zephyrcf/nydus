@@ -26,11 +26,10 @@ use nydus_api::ConfigV2;
 use nydus_rafs::fs::Rafs;
 use nydus_rafs::metadata::RafsInode;
 use nydus_rafs::{RafsError, RafsIoRead};
-use nydus_storage::factory::BLOB_FACTORY;
 use serde::{Deserialize, Serialize};
 use versionize::{VersionMap, Versionize, VersionizeResult};
 use versionize_derive::Versionize;
-
+use nydus_storage::factory::BLOB_FACTORY;
 use crate::upgrade::UpgradeManager;
 use crate::{Error, FsBackendDescriptor, FsBackendType, Result};
 
@@ -115,8 +114,8 @@ pub trait FsService: Send + Sync {
         if self.backend_from_mountpoint(&cmd.mountpoint)?.is_some() {
             return Err(Error::AlreadyExists);
         }
-        let backend = fs_backend_factory(&cmd)?;
-        let index = self.get_vfs().mount(backend, &cmd.mountpoint)?;
+        let (backend, id_mapping) = fs_backend_factory(&cmd)?;
+        let index = self.get_vfs().mount(backend, &cmd.mountpoint, id_mapping)?;
         info!("{} filesystem mounted at {}", &cmd.fs_type, &cmd.mountpoint);
 
         if let Err(e) = self.backend_collection().add(&cmd.mountpoint, &cmd) {
@@ -169,9 +168,9 @@ pub trait FsService: Send + Sync {
 
     /// Restore a filesystem instance.
     fn restore_mount(&self, cmd: &FsBackendMountCmd, vfs_index: u8) -> Result<()> {
-        let backend = fs_backend_factory(cmd)?;
+        let (backend, id_mapping) = fs_backend_factory(cmd)?;
         self.get_vfs()
-            .restore_mount(backend, vfs_index, &cmd.mountpoint)
+            .restore_mount(backend, vfs_index, &cmd.mountpoint, id_mapping)
             .map_err(VfsError::RestoreMount)?;
         self.backend_collection().add(&cmd.mountpoint, cmd)?;
         info!("backend fs restored at {}", cmd.mountpoint);
@@ -293,12 +292,15 @@ fn validate_prefetch_file_list(input: &Option<Vec<String>>) -> Result<Option<Vec
     }
 }
 
-fn fs_backend_factory(cmd: &FsBackendMountCmd) -> Result<BackFileSystem> {
+fn fs_backend_factory(
+    cmd: &FsBackendMountCmd,
+) -> Result<(BackFileSystem, Option<(u32, u32, u32)>)> {
     let prefetch_files = validate_prefetch_file_list(&cmd.prefetch_files)?;
 
     match cmd.fs_type {
         FsBackendType::Rafs => {
             let config = ConfigV2::from_str(cmd.config.as_str()).map_err(RafsError::LoadConfig)?;
+            let id_mapping = config.get_id_mapping();
             let config = Arc::new(config);
             let (mut rafs, reader) = Rafs::new(&config, &cmd.mountpoint, Path::new(&cmd.source))?;
             rafs.import(reader, prefetch_files)?;
@@ -365,12 +367,12 @@ fn fs_backend_factory(cmd: &FsBackendMountCmd) -> Result<BackFileSystem> {
                             .import()
                             .map_err(|e| Error::InvalidConfig(format!("{}", e)))?;
                         info!("Overlay filesystem imported");
-                        Ok(Box::new(overlayfs))
+                        Ok((Box::new(overlayfs), id_mapping))
                     }
                 }
                 None => {
                     info!("RAFS filesystem imported");
-                    Ok(Box::new(rafs))
+                    Ok((Box::new(rafs), id_mapping))
                 }
             }
         }
@@ -396,7 +398,7 @@ fn fs_backend_factory(cmd: &FsBackendMountCmd) -> Result<BackFileSystem> {
                     PassthroughFs::<()>::new(fs_cfg).map_err(Error::PassthroughFs)?;
                 passthrough_fs.import().map_err(Error::PassthroughFs)?;
                 info!("PassthroughFs imported");
-                Ok(Box::new(passthrough_fs))
+                Ok((Box::new(passthrough_fs), None))
             }
         }
     }
@@ -405,6 +407,7 @@ fn fs_backend_factory(cmd: &FsBackendMountCmd) -> Result<BackFileSystem> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use vmm_sys_util::tempdir::TempDir;
 
     #[test]
     fn it_should_add_new_backend() {
@@ -462,7 +465,7 @@ mod tests {
             "/etc/passwd".to_string(),
             "relative/path".to_string(),
         ]))
-        .is_err());
+            .is_err());
     }
 
     #[test]
@@ -539,44 +542,53 @@ mod tests {
 
     #[test]
     fn it_should_create_rafs_backend() {
+        let tmp_dir = TempDir::new().unwrap();
+        let root_dir = std::env::var("CARGO_MANIFEST_DIR").expect("$CARGO_MANIFEST_DIR");
+
+        let mut blob_src = PathBuf::from(&root_dir);
+        blob_src.push("../tests/texture/blobs/be7d77eeb719f70884758d1aa800ed0fb09d701aaec469964e9d54325f0d5fef");
+        let mut blob_dst = tmp_dir.as_path().to_path_buf();
+        blob_dst.push("be7d77eeb719f70884758d1aa800ed0fb09d701aaec469964e9d54325f0d5fef");
+        std::fs::copy(&blob_src, &blob_dst).unwrap();
+
+        let mut bootstrap = PathBuf::from(&root_dir);
+        bootstrap.push("../tests/texture/bootstrap/rafs-v6-2.2.boot");
+
         let config = r#"
-        {
-            "device": {
-              "backend": {
-                "type": "oss",
-                "config": {
-                  "endpoint": "test",
-                  "access_key_id": "test",
-                  "access_key_secret": "test",
-                  "bucket_name": "antsys-nydus",
-                  "object_prefix":"nydus_v2/",
-                  "scheme": "http"
-                }
-              }
-            },
-            "mode": "direct",
-            "digest_validate": false,
-            "enable_xattr": true,
-            "fs_prefetch": {
-              "enable": true,
-              "threads_count": 10,
-              "merging_size": 131072,
-              "bandwidth_rate": 10485760
-            }
-          }"#;
-        let bootstrap = "../tests/texture/bootstrap/nydusd_daemon_test_bootstrap";
-        if fs_backend_factory(&FsBackendMountCmd {
+            version = 2
+            id = "factory1"
+
+            [backend]
+            type = "localfs"
+
+            [backend.localfs]
+            dir = "/tmp/nydus"
+
+            [cache]
+            type = "filecache"
+
+            [cache.filecache]
+            work_dir = "/tmp/nydus"
+
+            [rafs]
+            mode = "direct"
+            enable_xattr = true
+        "#;
+
+        let config = config
+            .replace("/tmp/nydus", tmp_dir.as_path().to_str().unwrap())
+            .replace("RAFS_V6", &bootstrap.display().to_string());
+        let (backend, id_mapping) = fs_backend_factory(&FsBackendMountCmd {
             fs_type: FsBackendType::Rafs,
-            config: config.to_string(),
+            config,
             mountpoint: "testmountpoint".to_string(),
-            source: bootstrap.to_string(),
+            source: bootstrap.display().to_string(),
             prefetch_files: Some(vec!["/testfile".to_string()]),
         })
-        .unwrap()
-        .as_any()
-        .downcast_ref::<Rafs>()
-        .is_none()
-        {
+            .unwrap();
+
+        assert!(id_mapping.is_none());
+        if backend.as_any().downcast_ref::<Rafs>().is_none() {
             panic!("failed to create rafs backend")
         }
     }

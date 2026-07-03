@@ -793,6 +793,7 @@ pub fn create_vfs_backend(
     _fs_type: FsBackendType,
     _is_fuse: bool,
     _hybrid_mode: bool,
+    _id_mapping: (u32, u32, u32),
 ) -> Result<Arc<Vfs>> {
     let vfs = fuse_backend_rs::api::Vfs::new(fuse_backend_rs::api::VfsOptions::default());
     Ok(Arc::new(vfs))
@@ -803,8 +804,12 @@ pub fn create_vfs_backend(
     fs_type: FsBackendType,
     is_fuse: bool,
     hybrid_mode: bool,
+    id_mapping: (u32, u32, u32),
 ) -> Result<Arc<Vfs>> {
-    let mut opts = fuse_backend_rs::api::VfsOptions::default();
+    let mut opts = fuse_backend_rs::api::VfsOptions {
+        id_mapping,
+        ..Default::default()
+    };
     match fs_type {
         FsBackendType::PassthroughFs => {
             // passthroughfs requires !no_open
